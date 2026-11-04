@@ -218,3 +218,28 @@ async def test_discovery_failure_falls_back_to_static_ids(tmp_path):
         ids = [item["id"] for item in payload["data"]]
     assert len(ids) == 10
     assert "claude-sonnet" in ids
+
+
+async def test_private_urls_are_rewritten_before_upstream(tmp_path):
+    seen: list[dict] = []
+    app = build_app(ok_handler(seen), write_cookie(tmp_path))
+    body = chat_body(messages=[{"role": "user", "content": "check http://127.0.0.1:9222/x now"}])
+    response = await post(app, body)
+    assert response.status_code == 200
+    assert seen[0]["messages"][0]["content"] == "check 127.0.0.1:9222/x now"
+
+
+async def test_cloudfront_block_maps_to_502(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/workspace":
+            return httpx.Response(200, text="<html></html>")
+        return httpx.Response(
+            403,
+            headers={"server": "CloudFront", "content-type": "text/html"},
+            text="<html><body>Request blocked.</body></html>",
+        )
+
+    app = build_app(handler, write_cookie(tmp_path))
+    response = await post(app, chat_body())
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_blocked"

@@ -279,6 +279,7 @@ def create_app(
             "est_prompt_tokens": prompt_tokens,
             "est_completion_tokens": completion_tokens,
             "sources_count": len(result.sources),
+            "rewritten_private_urls": result.rewritten_urls,
         }
         if settings.log_prompts:
             fields["completion"] = result.content

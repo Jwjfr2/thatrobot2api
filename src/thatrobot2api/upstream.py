@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,29 @@ import httpx
 from .config import Settings
 
 SESSION_COOKIE = "tr_session"
+
+# CloudFront's managed SSRF rule rejects bodies containing a URL whose host is
+# loopback/private (verified live: http://127.0.0.1/x, http://localhost, ftp://127.0.0.1,
+# ws://127.0.0.1 -> 403; bare 127.0.0.1 and public URLs -> 200). OMP's own system
+# prompt mentions http://127.0.0.1:9222, so the scheme is dropped before forwarding;
+# the host, port and path stay readable to the model.
+PRIVATE_URL_RE = re.compile(
+    r"(?i)\b(?:https?|wss?|ftp)://(?="
+    r"(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|10(?:\.\d{1,3}){3}"
+    r"|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+    r"|169\.254(?:\.\d{1,3}){2})(?![\w.-])(?::\d+)?"
+    r")"
+)
+
+
+def rewrite_private_urls(messages: list[dict[str, str]]) -> tuple[list[dict[str, str]], int]:
+    rewritten = 0
+    sanitized: list[dict[str, str]] = []
+    for message in messages:
+        content, hits = PRIVATE_URL_RE.subn("", message["content"])
+        rewritten += hits
+        sanitized.append({**message, "content": content})
+    return sanitized, rewritten
 
 
 class CookieError(RuntimeError):
@@ -74,6 +98,7 @@ class UpstreamResult:
     content: str
     sources: list
     latency_ms: int
+    rewritten_urls: int = 0
 
 
 class ThatRobotClient:
@@ -129,6 +154,7 @@ class ThatRobotClient:
 
     async def chat(self, model: str, messages: list[dict[str, str]]) -> UpstreamResult:
         headers = await self._session_header()
+        messages, rewritten_urls = rewrite_private_urls(messages)
 
         started = time.perf_counter()
         try:
@@ -174,6 +200,7 @@ class ThatRobotClient:
             content=content,
             sources=sources if isinstance(sources, list) else [],
             latency_ms=latency_ms,
+            rewritten_urls=rewritten_urls,
         )
 
 
@@ -192,9 +219,26 @@ def _raise_for_status(response: httpx.Response) -> None:
         )
     if status == 429:
         raise UpstreamError(429, "rate_limited", f"Upstream rate limited: {detail}", "rate_limit_error")
+    if _is_cdn_block(response):
+        raise UpstreamError(
+            502,
+            "upstream_blocked",
+            "Upstream CDN blocked the request (WAF). Loopback/private URLs in the prompt are "
+            "the known trigger; the proxy strips their scheme, so this indicates another rule. "
+            f"CDN said: {detail}",
+            "upstream_error",
+        )
     if 400 <= status < 500:
         raise UpstreamError(400, "invalid_request", f"Upstream rejected the request: {detail}", "invalid_request_error")
     raise UpstreamError(502, "upstream_error", f"Upstream failed ({status}): {detail}", "upstream_error")
+
+
+def _is_cdn_block(response: httpx.Response) -> bool:
+    return (
+        response.status_code == 403
+        and response.headers.get("server", "").lower() == "cloudfront"
+        and response.headers.get("content-type", "").startswith("text/html")
+    )
 
 
 def _error_text(response: httpx.Response) -> str:

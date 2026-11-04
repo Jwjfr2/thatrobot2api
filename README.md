@@ -111,6 +111,13 @@ Refresh by logging into `platform.thatrobot.ai` and writing the new `tr_session`
 * No tool calling, function calling, images, or structured output — `tools`, `tool_choice`, `response_format`, `n>1`, `logprobs`, `audio`, `modalities` return `400 unsupported_parameter`.
 * Sampling parameters are ignored by the upstream; the proxy accepts and drops them rather than failing clients.
 * `usage` is estimated as `ceil(chars / 4)`; it is not provider-reported.
+* The upstream's CloudFront WAF (SSRF managed rule) rejects any body containing a URL
+  whose host is loopback/private: `http://127.0.0.1/x`, `http://localhost`,
+  `ftp://127.0.0.1`, `ws://127.0.0.1` all return a CloudFront 403. The proxy therefore
+  strips the scheme from such URLs before forwarding (`http://127.0.0.1:9222` becomes
+  `127.0.0.1:9222`); the host, port, and path reach the model unchanged. Every rewrite
+  is counted in the `rewritten_private_urls` log field. A surviving CDN block maps to
+  `502 upstream_blocked`.
 
 ## Docker
 
